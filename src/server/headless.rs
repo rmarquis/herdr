@@ -193,7 +193,8 @@ pub struct HeadlessServer {
     app: app::App,
     #[cfg(unix)]
     api_tx: Option<api::ApiRequestSender>,
-    #[cfg(unix)]
+    // Kept on every platform so dropping HeadlessServer owns API server shutdown.
+    #[cfg_attr(windows, allow(dead_code))]
     api_server: Option<api::ServerHandle>,
     #[cfg(unix)]
     client_listener: LocalListener,
@@ -246,9 +247,9 @@ fn apply_terminal_attach_scroll(
         AttachScrollDirection::Down => MouseEventKind::ScrollDown,
     };
     if let AttachScrollSource::PageKey { input } = source {
-        let host_scroll = runtime.input_state().is_some_and(|input_state| {
-            !input_state.alternate_screen && !input_state.mouse_reporting_enabled()
-        });
+        let host_scroll = runtime
+            .input_state()
+            .is_some_and(crate::pane::InputState::plain_page_keys_use_host_scrollback);
         if host_scroll {
             match direction {
                 AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
@@ -386,13 +387,11 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
-        let _ = (&api_tx, &api_server);
-
+        let _ = api_tx;
         Ok(Self {
             app,
             #[cfg(unix)]
             api_tx,
-            #[cfg(unix)]
             api_server,
             #[cfg(unix)]
             client_listener: listener,
@@ -501,92 +500,9 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.scheduled_tasks");
             }
 
-            // Handle deferred requests.
-            if self.app.state.request_complete_onboarding {
-                self.app.state.request_complete_onboarding = false;
-                self.app.open_settings_from_onboarding();
+            if self.handle_deferred_requests_headless() {
                 needs_render = true;
                 needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_onboarding");
-            }
-
-            if self.app.state.request_new_workspace {
-                self.app.state.request_new_workspace = false;
-                self.app.create_workspace();
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_new_workspace");
-            }
-
-            if self.app.state.request_new_tab {
-                self.app.state.request_new_tab = false;
-                self.app.create_tab();
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_new_tab");
-            }
-
-            if let Some(ws_idx) = self.app.state.request_new_linked_worktree.take() {
-                self.app.open_new_linked_worktree_dialog(ws_idx);
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
-            }
-
-            if let Some(ws_idx) = self.app.state.request_open_existing_worktree.take() {
-                self.app.open_existing_worktree_dialog(ws_idx);
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
-            }
-
-            if let Some(cwd) = self.app.state.request_new_workspace_cwd.take() {
-                if let Err(err) = self.app.create_workspace_with_events(cwd, true) {
-                    error!(err = %err, "failed to create workspace at requested cwd");
-                    self.app.state.mode = app::Mode::Navigate;
-                }
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_workspace_cwd");
-            }
-
-            if let Some(ws_idx) = self.app.state.request_remove_linked_worktree.take() {
-                self.app.open_remove_linked_worktree_confirmation(ws_idx);
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
-            }
-
-            if self.app.state.request_submit_worktree_create {
-                self.app.state.request_submit_worktree_create = false;
-                self.app.submit_worktree_create_via_api();
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_worktree_submit");
-            }
-
-            if self.app.state.request_submit_worktree_open {
-                self.app.state.request_submit_worktree_open = false;
-                self.app.submit_worktree_open_via_api();
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_worktree_submit");
-            }
-
-            if self.app.state.request_submit_worktree_remove {
-                self.app.state.request_submit_worktree_remove = false;
-                self.app.submit_worktree_remove_via_api();
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.deferred_worktree_submit");
-            }
-
-            if self.app.state.request_reload_config {
-                self.app.state.request_reload_config = false;
-                self.reload_server_config(true);
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.config_reload");
             }
 
             if latest_app_client(&self.clients).is_some() && self.app.ensure_default_workspace() {
@@ -688,6 +604,173 @@ impl HeadlessServer {
 
         info!("headless server exiting");
         Ok(())
+    }
+
+    fn handle_deferred_requests_headless(&mut self) -> bool {
+        let mut needs_render = false;
+
+        if self.app.state.request_complete_onboarding {
+            self.app.state.request_complete_onboarding = false;
+            self.app.open_settings_from_onboarding();
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_onboarding");
+        }
+
+        if self.app.state.request_new_workspace {
+            self.app.state.request_new_workspace = false;
+            let response = self.headless_workspace_create("headless.workspace.create", None, None);
+            if let Err(error) = response {
+                error!(
+                    code = %error.code,
+                    message = %error.message,
+                    "failed to create workspace"
+                );
+            }
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_new_workspace");
+        }
+
+        if self.app.state.request_new_tab {
+            self.app.state.request_new_tab = false;
+            let label = self.app.state.requested_new_tab_name.take();
+            let response = self.headless_tab_create("headless.tab.create", label);
+            if let Err(error) = response {
+                error!(
+                    code = %error.code,
+                    message = %error.message,
+                    "failed to create tab"
+                );
+            }
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_new_tab");
+        }
+
+        if let Some(ws_idx) = self.app.state.request_new_linked_worktree.take() {
+            self.app.open_new_linked_worktree_dialog(ws_idx);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+        }
+
+        if let Some(ws_idx) = self.app.state.request_open_existing_worktree.take() {
+            self.app.open_existing_worktree_dialog(ws_idx);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+        }
+
+        if let Some(cwd) = self.app.state.request_new_workspace_cwd.take() {
+            let response = self.headless_workspace_create(
+                "headless.workspace.create_cwd",
+                Some(cwd.display().to_string()),
+                None,
+            );
+            if let Err(error) = response {
+                error!(
+                    code = %error.code,
+                    message = %error.message,
+                    "failed to create workspace at requested cwd"
+                );
+                self.app.state.mode = app::Mode::Navigate;
+            }
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_workspace_cwd");
+        }
+
+        if let Some(ws_idx) = self.app.state.request_remove_linked_worktree.take() {
+            self.app.open_remove_linked_worktree_confirmation(ws_idx);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+        }
+
+        if self.app.state.request_submit_worktree_create {
+            self.app.state.request_submit_worktree_create = false;
+            self.app.submit_worktree_create_via_api();
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_submit");
+        }
+
+        if self.app.state.request_submit_worktree_open {
+            self.app.state.request_submit_worktree_open = false;
+            self.app.submit_worktree_open_via_api();
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_submit");
+        }
+
+        if self.app.state.request_submit_worktree_remove {
+            self.app.state.request_submit_worktree_remove = false;
+            self.app.submit_worktree_remove_via_api();
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_submit");
+        }
+
+        if self.app.state.request_reload_config {
+            self.app.state.request_reload_config = false;
+            self.reload_server_config(true);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.config_reload");
+        }
+
+        needs_render
+    }
+
+    fn headless_workspace_create(
+        &mut self,
+        id: &'static str,
+        cwd: Option<String>,
+        label: Option<String>,
+    ) -> Result<(), api::schema::ErrorBody> {
+        self.dispatch_headless_runtime_mutation(
+            id,
+            api::schema::Method::WorkspaceCreate(api::schema::WorkspaceCreateParams {
+                cwd,
+                focus: true,
+                label,
+                env: Default::default(),
+            }),
+        )
+    }
+
+    fn headless_tab_create(
+        &mut self,
+        id: &'static str,
+        label: Option<String>,
+    ) -> Result<(), api::schema::ErrorBody> {
+        self.dispatch_headless_runtime_mutation(
+            id,
+            api::schema::Method::TabCreate(api::schema::TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: true,
+                label,
+                env: Default::default(),
+            }),
+        )
+    }
+
+    fn dispatch_headless_runtime_mutation(
+        &mut self,
+        id: &'static str,
+        method: api::schema::Method,
+    ) -> Result<(), api::schema::ErrorBody> {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        self.handle_api_request_with_shutdown_check_inner(
+            api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: id.to_string(),
+                    method,
+                },
+                respond_to,
+            },
+            true,
+        );
+        match response_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(response) => serde_json::from_str::<api::schema::ErrorResponse>(&response)
+                .map(|response| Err(response.error))
+                .unwrap_or(Ok(())),
+            Err(err) => Err(api::schema::ErrorBody {
+                code: "internal_error".into(),
+                message: format!("headless runtime mutation response failed: {err}"),
+            }),
+        }
     }
 
     fn allocate_activity_stamp(&mut self) -> u64 {
@@ -2673,6 +2756,14 @@ impl HeadlessServer {
     /// trigger internal events that may set toast state or would normally
     /// play sounds — in headless mode we forward these to clients instead.
     fn handle_api_request_with_shutdown_check(&mut self, msg: api::ApiRequestMessage) -> bool {
+        self.handle_api_request_with_shutdown_check_inner(msg, false)
+    }
+
+    fn handle_api_request_with_shutdown_check_inner(
+        &mut self,
+        msg: api::ApiRequestMessage,
+        skip_default_workspace_for_request: bool,
+    ) -> bool {
         if self.shutting_down {
             // During shutdown, respond with server_unavailable.
             let response = serde_json::to_string(&api::schema::ErrorResponse {
@@ -2734,10 +2825,11 @@ impl HeadlessServer {
         }
 
         let mut changed = api::request_changes_ui(&msg.request);
-        let skip_default_workspace = matches!(
-            &msg.request.method,
-            api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
-        );
+        let skip_default_workspace = skip_default_workspace_for_request
+            || matches!(
+                &msg.request.method,
+                api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
+            );
         changed |= self.drain_all_internal_events_with_forwarding();
 
         // Capture toast and effective pane states before the API call so we can
@@ -3132,6 +3224,7 @@ impl HeadlessServer {
             && self.app.state.copy_mode.is_none()
             && self.app.state.context_menu.is_none()
             && self.app.state.toast.is_none()
+            && self.app.state.copy_feedback.is_none()
             && !self.app.full_redraw_pending
     }
 
@@ -4049,9 +4142,13 @@ mod tests {
     use crate::protocol::CursorState;
 
     fn test_headless_server() -> HeadlessServer {
+        test_headless_server_with_event_hub(api::EventHub::default())
+    }
+
+    fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServer {
         let config = crate::config::Config::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = crate::app::App::new(&config, true, None, api_rx, api::EventHub::default());
+        let mut app = crate::app::App::new(&config, true, None, api_rx, event_hub);
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
 
@@ -4084,7 +4181,6 @@ mod tests {
             app,
             #[cfg(unix)]
             api_tx: None,
-            #[cfg(unix)]
             api_server: None,
             #[cfg(unix)]
             client_listener: listener,
@@ -4110,6 +4206,12 @@ mod tests {
             should_quit,
             server_event_rx,
             server_event_tx,
+        }
+    }
+
+    fn shutdown_test_runtimes(server: &mut HeadlessServer) {
+        for (_, runtime) in server.app.terminal_runtimes.drain() {
+            runtime.shutdown();
         }
     }
 
@@ -4181,6 +4283,70 @@ mod tests {
             Some(expected_version.as_str())
         );
         assert!(server.app.event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn headless_deferred_workspace_create_uses_runtime_events() {
+        let event_hub = api::EventHub::default();
+        let mut server = test_headless_server_with_event_hub(event_hub.clone());
+
+        server.app.state.request_new_workspace = true;
+
+        assert!(server.handle_deferred_requests_headless());
+        assert!(!server.app.state.request_new_workspace);
+        assert_eq!(
+            event_hub
+                .events_after(0)
+                .into_iter()
+                .map(|(_, event)| event.event)
+                .collect::<Vec<_>>(),
+            vec![
+                api::schema::EventKind::WorkspaceCreated,
+                api::schema::EventKind::TabCreated,
+                api::schema::EventKind::PaneCreated,
+                api::schema::EventKind::LayoutUpdated,
+            ]
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn headless_deferred_named_tab_create_uses_runtime_events() {
+        let event_hub = api::EventHub::default();
+        let mut server = test_headless_server_with_event_hub(event_hub.clone());
+        server
+            .app
+            .create_workspace_with_options(std::env::temp_dir(), true)
+            .unwrap();
+        let after_setup = event_hub.current_sequence();
+
+        server.app.state.request_new_tab = true;
+        server.app.state.requested_new_tab_name = Some("ops".into());
+
+        assert!(server.handle_deferred_requests_headless());
+        assert!(!server.app.state.request_new_tab);
+        assert_eq!(server.app.state.requested_new_tab_name, None);
+        let events = event_hub.events_after(after_setup);
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, event)| event.event)
+                .collect::<Vec<_>>(),
+            vec![
+                api::schema::EventKind::TabCreated,
+                api::schema::EventKind::PaneCreated,
+                api::schema::EventKind::LayoutUpdated,
+            ]
+        );
+        let tab_created = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                api::schema::EventData::TabCreated { tab } => Some(tab),
+                _ => None,
+            })
+            .expect("tab created event");
+        assert_eq!(tab_created.label, "ops");
+        shutdown_test_runtimes(&mut server);
     }
 
     fn test_client_writer() -> (
@@ -5120,14 +5286,17 @@ next_tab = ""
         rt.shutdown_timeout(Duration::from_millis(100));
     }
 
-    #[test]
-    fn terminal_attach_page_key_host_scrolls_plain_terminal() {
+    fn with_terminal_attach_page_key_runtime(
+        initial_bytes: &[u8],
+        initial_scroll: usize,
+        test: impl FnOnce(&crate::terminal::TerminalRuntime, &mut mpsc::Receiver<Bytes>),
+    ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         let _runtime_guard = rt.enter();
-        let mut bytes = Vec::new();
+        let mut bytes = initial_bytes.to_vec();
         for line in 0..80 {
             bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
         }
@@ -5135,9 +5304,20 @@ next_tab = ""
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 20, 5, 4096, &bytes, 4,
             );
+        if initial_scroll > 0 {
+            runtime.scroll_up(initial_scroll);
+        }
 
+        test(&runtime, &mut input_rx);
+
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    fn apply_terminal_attach_page_up(runtime: &crate::terminal::TerminalRuntime) {
         apply_terminal_attach_scroll(
-            &runtime,
+            runtime,
             AttachScrollSource::PageKey {
                 input: b"\x1b[5~".to_vec(),
             },
@@ -5147,111 +5327,80 @@ next_tab = ""
             None,
             0,
         )
-        .expect("page key scroll");
+        .expect("page key");
+    }
 
-        assert_eq!(
-            runtime
-                .scroll_metrics()
-                .expect("scroll metrics")
-                .offset_from_bottom,
-            4
-        );
-        assert!(input_rx.try_recv().is_err());
-        drop(runtime);
-        drop(_runtime_guard);
-        rt.shutdown_timeout(Duration::from_millis(100));
+    #[test]
+    fn terminal_attach_page_key_host_scrolls_plain_terminal() {
+        with_terminal_attach_page_key_runtime(b"", 0, |runtime, input_rx| {
+            apply_terminal_attach_page_up(runtime);
+
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                4
+            );
+            assert!(input_rx.try_recv().is_err());
+        });
     }
 
     #[test]
     fn terminal_attach_page_key_forwards_when_mouse_reporting() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let _runtime_guard = rt.enter();
-        let mut bytes = b"\x1b[?1000h".to_vec();
-        for line in 0..80 {
-            bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
-        }
-        let (runtime, mut input_rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                20, 5, 4096, &bytes, 4,
+        with_terminal_attach_page_key_runtime(b"\x1b[?1000h", 3, |runtime, input_rx| {
+            apply_terminal_attach_page_up(runtime);
+
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
             );
-        runtime.scroll_up(3);
+            assert_eq!(
+                input_rx.try_recv().expect("forwarded page key"),
+                Bytes::from_static(b"\x1b[5~")
+            );
+        });
+    }
 
-        apply_terminal_attach_scroll(
-            &runtime,
-            AttachScrollSource::PageKey {
-                input: b"\x1b[5~".to_vec(),
-            },
-            AttachScrollDirection::Up,
-            4,
-            None,
-            None,
-            0,
-        )
-        .expect("page key forward");
+    #[test]
+    fn terminal_attach_page_key_forwards_when_application_cursor() {
+        with_terminal_attach_page_key_runtime(b"\x1b[?1h", 3, |runtime, input_rx| {
+            apply_terminal_attach_page_up(runtime);
 
-        assert_eq!(
-            runtime
-                .scroll_metrics()
-                .expect("scroll metrics")
-                .offset_from_bottom,
-            0
-        );
-        assert_eq!(
-            input_rx.try_recv().expect("forwarded page key"),
-            Bytes::from_static(b"\x1b[5~")
-        );
-        drop(runtime);
-        drop(_runtime_guard);
-        rt.shutdown_timeout(Duration::from_millis(100));
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
+            );
+            assert_eq!(
+                input_rx.try_recv().expect("forwarded page key"),
+                Bytes::from_static(b"\x1b[5~")
+            );
+        });
     }
 
     #[test]
     fn terminal_attach_page_key_forwards_in_alternate_screen_without_mouse_reporting() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let _runtime_guard = rt.enter();
-        let mut bytes = b"\x1b[?1049h".to_vec();
-        for line in 0..80 {
-            bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
-        }
-        let (runtime, mut input_rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                20, 5, 4096, &bytes, 4,
+        with_terminal_attach_page_key_runtime(b"\x1b[?1049h", 3, |runtime, input_rx| {
+            apply_terminal_attach_page_up(runtime);
+
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
             );
-        runtime.scroll_up(3);
-
-        apply_terminal_attach_scroll(
-            &runtime,
-            AttachScrollSource::PageKey {
-                input: b"\x1b[5~".to_vec(),
-            },
-            AttachScrollDirection::Up,
-            4,
-            None,
-            None,
-            0,
-        )
-        .expect("page key forward");
-
-        assert_eq!(
-            runtime
-                .scroll_metrics()
-                .expect("scroll metrics")
-                .offset_from_bottom,
-            0
-        );
-        assert_eq!(
-            input_rx.try_recv().expect("forwarded page key"),
-            Bytes::from_static(b"\x1b[5~")
-        );
-        drop(runtime);
-        drop(_runtime_guard);
-        rt.shutdown_timeout(Duration::from_millis(100));
+            assert_eq!(
+                input_rx.try_recv().expect("forwarded page key"),
+                Bytes::from_static(b"\x1b[5~")
+            );
+        });
     }
 
     #[test]
@@ -7115,6 +7264,48 @@ next_tab = ""
         assert!(
             client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "retained path should not stream a frame that can overwrite toast cells"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_pty_update_declines_while_copy_feedback_is_visible() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        server.app.state.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "copied to clipboard".to_owned(),
+        });
+        server.render_and_stream();
+        let initial = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        let initial_text = frame_text(&initial);
+        assert!(
+            initial_text.contains("copied to clipboard"),
+            "expected initial full frame to include copy feedback"
+        );
+
+        let feedback_row = initial_text
+            .lines()
+            .position(|line| line.contains("copied to clipboard"))
+            .expect("copy feedback row") as u16;
+        let inner_rect = server.app.state.view.pane_infos[0].inner_rect;
+        let pane_row = feedback_row
+            .checked_sub(inner_rect.y)
+            .expect("copy feedback should overlap the pane")
+            + 1;
+        assert!(pane_row <= inner_rect.height);
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(format!("\x1b[{pane_row};1Hzzzz").as_bytes());
+
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "retained path should not stream a frame that can overwrite copy feedback cells"
         );
     }
 

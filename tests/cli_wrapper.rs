@@ -1031,6 +1031,7 @@ fn help_commands_exit_successfully() {
         &["--help"],
         &["api", "-h"],
         &["api", "schema", "-h"],
+        &["completion", "-h"],
         &["status", "-h"],
         &["server", "-h"],
         &["workspace", "-h"],
@@ -1057,6 +1058,46 @@ fn help_commands_exit_successfully() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn completion_command_prints_zsh_script_without_session_startup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["completion", "zsh"])
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#compdef herdr"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("bash elvish fish powershell zsh"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("'--direction[]:DIRECTION:(right down)'"),
+        "pane split/plugin pane open should complete --direction right|down without requiring equals: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--cwd=[]"),
+        "zsh completions should not suggest equals-style values unsupported by most manual parsers: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--direction=[]"),
+        "zsh completions should not suggest equals-style direction values: {stdout}"
+    );
+    assert!(
+        !stdout.contains("live-handoff"),
+        "internal server handoff command should not be completed: {stdout}"
+    );
 }
 
 #[test]
@@ -1129,6 +1170,57 @@ fn api_schema_json_prints_bundled_schema() {
             .map(serde_json::Map::len),
         Some(5)
     );
+}
+
+#[test]
+fn api_snapshot_prints_live_session_snapshot() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(700);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut line = String::new();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        reader.read_line(&mut line).unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(request["method"], "session.snapshot");
+                        assert_eq!(request["id"], "cli:api:snapshot");
+
+                        let response = serde_json::json!({
+                            "id": "cli:api:snapshot",
+                            "result": {
+                                "type": "ok",
+                                "marker": "snapshot-passthrough"
+                            }
+                        });
+                        writeln!(stream, "{response}").unwrap();
+                        stream.flush().unwrap();
+                        let _ = fs::remove_file(socket_path);
+                        return;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept failed: {err}"),
+                }
+            }
+            panic!("CLI did not connect to fake API socket");
+        }
+    });
+
+    let value = run_cli_json(&socket_path, &["api", "snapshot"]);
+
+    assert_eq!(value["result"]["marker"], "snapshot-passthrough");
+    server.join().unwrap();
+    cleanup_test_base(&base);
 }
 
 #[test]
@@ -4172,6 +4264,48 @@ fn wait_agent_status_exits_immediately_when_status_already_matches() {
     assert_eq!(waited_json["event"], "pane.agent_status_changed");
     assert_eq!(waited_json["data"]["agent_status"], "idle");
     assert_eq!(waited_json["data"]["agent"], "pi");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn wait_agent_status_times_out_when_status_does_not_match() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_cli_timeout_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "agent-status",
+            "1-1",
+            "--status",
+            "blocked",
+            "--timeout",
+            "100",
+        ],
+    );
+    assert!(!waited.status.success());
+    assert!(
+        String::from_utf8_lossy(&waited.stderr)
+            .contains("timed out waiting for agent status change"),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
 
     cleanup_spawned_herdr(herdr, base);
 }

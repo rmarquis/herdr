@@ -14,6 +14,7 @@ mod creation;
 mod ids;
 mod input;
 mod runtime;
+mod runtime_mutations;
 mod session;
 pub mod state;
 mod terminal_targets;
@@ -121,6 +122,7 @@ pub struct App {
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
     pub(crate) update_manifest_check_enabled: bool,
+    pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
@@ -602,6 +604,7 @@ impl App {
             pane_borders: config.ui.pane_borders,
             pane_gaps: config.ui.pane_gaps,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
+            hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -708,6 +711,7 @@ impl App {
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             update_version_check_enabled: config.update.version_check,
             update_manifest_check_enabled: config.update.manifest_check,
+            loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
@@ -885,16 +889,14 @@ impl App {
 
             if self.state.request_new_workspace {
                 self.state.request_new_workspace = false;
-                self.dispatch_tui_api_request(
+                self.runtime_workspace_create(
                     "tui.workspace.create",
-                    crate::api::schema::Method::WorkspaceCreate(
-                        crate::api::schema::WorkspaceCreateParams {
-                            cwd: None,
-                            focus: true,
-                            label: None,
-                            env: Default::default(),
-                        },
-                    ),
+                    crate::api::schema::WorkspaceCreateParams {
+                        cwd: None,
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
                 );
                 needs_render = true;
             }
@@ -902,15 +904,15 @@ impl App {
             if self.state.request_new_tab {
                 self.state.request_new_tab = false;
                 let label = self.state.requested_new_tab_name.take();
-                self.dispatch_tui_api_request(
+                self.runtime_tab_create(
                     "tui.tab.create",
-                    crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
+                    crate::api::schema::TabCreateParams {
                         workspace_id: None,
                         cwd: None,
                         focus: true,
                         label,
                         env: Default::default(),
-                    }),
+                    },
                 );
                 needs_render = true;
             }
@@ -926,16 +928,14 @@ impl App {
             }
 
             if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
-                self.dispatch_tui_api_request(
+                self.runtime_workspace_create(
                     "tui.workspace.create_cwd",
-                    crate::api::schema::Method::WorkspaceCreate(
-                        crate::api::schema::WorkspaceCreateParams {
-                            cwd: Some(cwd.display().to_string()),
-                            focus: true,
-                            label: None,
-                            env: Default::default(),
-                        },
-                    ),
+                    crate::api::schema::WorkspaceCreateParams {
+                        cwd: Some(cwd.display().to_string()),
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
                 );
                 needs_render = true;
             }
@@ -1092,6 +1092,7 @@ impl App {
         if desired == *active {
             return Ok(());
         }
+        crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
         if desired {
             execute!(io::stdout(), EnableMouseCapture)?;
         } else {
@@ -1354,6 +1355,10 @@ impl App {
                     self.state.request_client_config_reload = true;
                 }
                 self.state.redraw_on_focus_gained = config.ui.redraw_on_focus_gained;
+                if self.loaded_host_cursor != config.ui.host_cursor {
+                    self.state.request_client_config_reload = true;
+                }
+                self.loaded_host_cursor = config.ui.host_cursor;
                 self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
@@ -1363,6 +1368,7 @@ impl App {
                 self.state.pane_gaps = config.ui.pane_gaps;
                 self.state.show_agent_labels_on_pane_borders =
                     config.ui.show_agent_labels_on_pane_borders;
+                self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.agent_panel_scroll = 0;
@@ -2465,6 +2471,30 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_requests_client_reload_for_host_cursor_only_change() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-host-cursor");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[ui]\nhost_cursor = \"native\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.request_client_config_reload = false;
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.loaded_host_cursor,
+            crate::config::HostCursorModeConfig::Native
+        );
+        assert!(app.state.request_client_config_reload);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
